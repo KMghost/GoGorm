@@ -280,7 +280,303 @@ db.Set("gorm:table_options", "ENGINE=InnoDB DEFAULT CHARSET=utf8 comment '图书
 
 ## 1、创建记录
 
+```go
+user := User{Name: "Jinzhu", Age: 18, Birthday: time.Now()}
+
+result := db.Create(&user) // 通过数据的指针来创建
+
+user.ID             // 返回插入数据的主键
+result.Error        // 返回 error
+result.RowsAffected // 返回插入记录的条数
 ```
 
+## 2、使用指定的字段创建记录
+
+创建记录并更新给出的字段。
+
+```go
+db.Select("Name", "Age", "CreatedAt").Create(&user)
+```
+
+创建一个记录且一同忽略传递给略去的字段值。
+
+```go
+db.Omit("Name", "Age", "CreatedAt").Create(&user)
+```
+
+## 3、批量插入
+
+要有效地插入大量记录，请将一个 `slice` 传递给 `Create` 方法。 GORM 将生成单独一条SQL语句来插入所有数据，并回填主键的值，钩子方法也会被调用。
+
+```go
+var users = []User{{Name: "jinzhu1"}, {Name: "jinzhu2"}, {Name: "jinzhu3"}}
+db.Create(&users)
+
+for _, user := range users {
+  user.ID // 1,2,3
+}
+```
+
+使用 `CreateInBatches` 分批创建时，你可以指定每批的数量
+
+```go
+var users = []User{{name: "jinzhu_1"}, ...., {Name: "jinzhu_10000"}}
+
+// 数量为 100
+db.CreateInBatches(users, 100)
+```
+
+[Upsert](https://gorm.io/zh_CN/docs/create.html#upsert) 和 [Create With Associations](https://gorm.io/zh_CN/docs/create.html#create_with_associations) 也支持批量插入
+
+**注意** 使用`CreateBatchSize` 选项初始化 GORM 时，所有的创建& 关联 `INSERT` 都将遵循该选项
+
+```go
+db, err := gorm.Open(sqlite.Open("gorm.db"), &gorm.Config{
+  CreateBatchSize: 1000,
+})
+
+db := db.Session(&gorm.Session{CreateBatchSize: 1000})
+
+users = [5000]User{{Name: "jinzhu", Pets: []Pet{pet1, pet2, pet3}}...}
+
+db.Create(&users)
+```
+
+
+
+## 4、创建钩子
+
+GORM 允许用户定义的钩子有 `BeforeSave`, `BeforeCreate`, `AfterSave`, `AfterCreate` 创建记录时将调用这些钩子方法，请参考 [Hooks](https://gorm.io/zh_CN/docs/hooks.html) 中关于生命周期的详细信息
+
+```go
+func (u *User) BeforeCreate(tx *gorm.DB) (err error) {
+  u.UUID = uuid.New()
+
+    if u.Role == "admin" {
+        return errors.New("invalid role")
+    }
+    return
+}
+```
+
+如果您想跳过 `钩子` 方法，您可以使用 `SkipHooks` 会话模式
+
+```go
+DB.Session(&gorm.Session{SkipHooks: true}).Create(&user)
+
+DB.Session(&gorm.Session{SkipHooks: true}).Create(&users)
+
+DB.Session(&gorm.Session{SkipHooks: true}).CreateInBatches(users, 100)
+```
+
+
+
+## 5、根据 Map 创建
+
+GORM 支持根据 `map[string]interface{}` 和 `[]map[string]interface{}{}` 创建记录
+
+```go
+db.Model(&User{}).Create(map[string]interface{}{
+  "Name": "jinzhu", "Age": 18,
+})
+
+// batch insert from `[]map[string]interface{}{}`
+db.Model(&User{}).Create([]map[string]interface{}{
+  {"Name": "jinzhu_1", "Age": 18},
+  {"Name": "jinzhu_2", "Age": 20},
+})
+```
+
+**注意：** 根据 map 创建记录时，association 不会被调用，且主键也不会自动填充
+
+
+
+## 6、使用 SQL 表达式、Context Valuer 创建记录
+
+GORM 允许使用 SQL 表达式插入数据，有两种方法实现这个目标。根据 `map[string]interface{}` 或 [自定义数据类型](https://gorm.io/zh_CN/docs/data_types.html#gorm_valuer_interface) 创建
+
+```go
+// 通过 map 创建记录
+db.Model(User{}).Create(map[string]interface{}{
+  "Name": "jinzhu",
+  "Location": clause.Expr{SQL: "ST_PointFromText(?)", Vars: []interface{}{"POINT(100 100)"}},
+})
+
+type User struct {
+  Name     string
+  Location Location
+}
+// 通过自定义类型创建记录
+type Location struct {
+    X, Y int
+}
+```
+
+## 7、关联创建
+
+创建关联数据时，如果关联值是非零值，这些关联会被 upsert，且它们的 `Hook` 方法也会被调用
+
+```go
+type CreditCard struct {
+  gorm.Model
+  Number   string
+  UserID   uint
+}
+
+type User struct {
+  gorm.Model
+  Name       string
+  CreditCard CreditCard
+}
+
+db.Create(&User{
+  Name: "jinzhu",
+  CreditCard: CreditCard{Number: "411111111111"}
+})
+// INSERT INTO `users` ...
+// INSERT INTO `credit_cards` ...
+```
+
+您也可以通过 `Select`、 `Omit` 跳过关联保存
+
+```go
+db.Omit("CreditCard").Create(&user)
+
+// 跳过所有关联
+db.Omit(clause.Associations).Create(&user)
+```
+
+
+
+## 8、默认值
+
+您可以通过标签 `default` 为字段定义默认值
+
+```go
+type User struct {
+  ID   int64
+  Name string `gorm:"default:galeone"`
+  Age  int64  `gorm:"default:18"`
+}
+```
+
+插入记录到数据库时，默认值 *会被用于* 填充值为 [零值](https://tour.golang.org/basics/12) 的字段
+
+**注意** 像 `0`、`''`、`false` 等零值，不会将这些字段定义的默认值保存到数据库。您需要使用指针类型或 Scanner/Valuer 来避免这个问题
+
+```go
+type User struct {
+  gorm.Model
+  Name string
+  Age  *int           `gorm:"default:18"`
+  Active sql.NullBool `gorm:"default:true"`
+}
+```
+
+若要数据库有默认、虚拟/生成的值，你必须为字段设置 `default` 标签。若要在迁移时跳过默认值定义，你可以使用 `default:(-)`
+
+```go
+type User struct {
+  ID        string `gorm:"default:uuid_generate_v3()"` // db func
+  FirstName string
+  LastName  string
+  Age       uint8
+  FullName  string `gorm:"->;type:GENERATED ALWAYS AS (concat(firstname,' ',lastname));default:(-);"`
+}
+```
+
+使用虚拟/生成的值时，你可能需要禁用它的创建、更新权限，查看 [字段级权限](https://gorm.io/zh_CN/docs/models.html#field_permission) 获取详情
+
+
+
+## 9、Upsert 及冲突
+
+GORM 为不同数据库提供了兼容的 Upsert 支持
+
+```go
+import "gorm.io/gorm/clause"
+
+// 在冲突时，什么都不做
+db.Clauses(clause.OnConflict{DoNothing: true}).Create(&user)
+
+// 在`id`冲突时，将列更新为默认值
+db.Clauses(clause.OnConflict{
+  Columns:   []clause.Column{{Name: "id"}},
+  DoUpdates: clause.Assignments(map[string]interface{}{"role": "user"}),
+}).Create(&users)
+// MERGE INTO "users" USING *** WHEN NOT MATCHED THEN INSERT *** WHEN MATCHED THEN UPDATE SET ***; SQL Server
+// INSERT INTO `users` *** ON DUPLICATE KEY UPDATE ***; MySQL
+
+// 使用SQL语句
+db.Clauses(clause.OnConflict{
+  Columns:   []clause.Column{{Name: "id"}},
+  DoUpdates: clause.Assignments(map[string]interface{}{"count": gorm.Expr("GREATEST(count, VALUES(count))")}),
+}).Create(&users)
+// INSERT INTO `users` *** ON DUPLICATE KEY UPDATE `count`=GREATEST(count, VALUES(count));
+
+// 在`id`冲突时，将列更新为新值
+db.Clauses(clause.OnConflict{
+  Columns:   []clause.Column{{Name: "id"}},
+  DoUpdates: clause.AssignmentColumns([]string{"name", "age"}),
+}).Create(&users)
+// MERGE INTO "users" USING *** WHEN NOT MATCHED THEN INSERT *** WHEN MATCHED THEN UPDATE SET "name"="excluded"."name"; SQL Server
+// INSERT INTO "users" *** ON CONFLICT ("id") DO UPDATE SET "name"="excluded"."name", "age"="excluded"."age"; PostgreSQL
+// INSERT INTO `users` *** ON DUPLICATE KEY UPDATE `name`=VALUES(name),`age=VALUES(age); MySQL
+
+// 在冲突时，更新除主键以外的所有列到新值。
+db.Clauses(clause.OnConflict{
+  UpdateAll: true,
+}).Create(&users)
+// INSERT INTO "users" *** ON CONFLICT ("id") DO UPDATE SET "name"="excluded"."name", "age"="excluded"."age", ...;
+```
+
+
+
+# 自定义数据类型
+
+GORM 提供了少量接口，使用户能够为 GORM 定义支持的数据类型，这里以 [json](https://github.com/go-gorm/datatypes/blob/master/json.go) 为例
+
+### 1、Scanner / Valuer
+
+自定义的数据类型必须实现 [Scanner](https://pkg.go.dev/database/sql#Scanner) 和 [Valuer](https://pkg.go.dev/database/sql/driver#Valuer) 接口，以便让 GORM 知道如何将该类型接收、保存到数据库
+
+- **Scanner**
+  - 从数据库取数据的时候使用。
+  - 把数据库类型转换为程序需要使用的类型。
+
+```go
+// Scan - Implement the database/sql scanner interface
+func (yne *YesNoEnum) Scan(value interface{}) error {
+	// if value is nil, false
+	if value == nil {
+		// set the value of the pointer yne to YesNoEnum(false)
+		*yne = YesNoEnum(false)
+		return nil
+	}
+	if bv, err := driver.Bool.ConvertValue(value); err == nil {
+		// if this is a bool type
+		if v, ok := bv.(bool); ok {
+			// set the value of the pointer yne to YesNoEnum(v)
+			*yne = YesNoEnum(v)
+			return nil
+		}
+	}
+	// otherwise, return an error
+	return errors.New("failed to scan YesNoEnum")
+}
+```
+
+- **Valuer**
+  - 把数据存进数据库
+  - 需要把程序类型转换为基础类型
+  - **使用时需要小心，此方法在 v2 版本可能会被多次调用**
+
+```go
+// Value - Implementation of valuer for database/sql
+func (yne YesNoEnum) Value() (driver.Value, error) {
+    // value needs to be a base driver.Value type
+    // such as bool.
+	return bool(yne), nil
+}
 ```
 
