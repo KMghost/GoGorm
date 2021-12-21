@@ -966,6 +966,504 @@ db.Raw("SELECT name, age FROM users WHERE name = ?", "Antonio").Scan(&result)
 
 
 
+## 5、高级查询
+
+### 1、智能选择字段
+
+GORM 允许通过 [`Select`](https://gorm.io/zh_CN/docs/query.html) 方法选择特定的字段，如果您在应用程序中经常使用此功能，你也可以定义一个较小的结构体，以实现调用 API 时自动选择特定的字段
+
+```go
+type User struct {
+  ID     uint
+  Name   string
+  Age    int
+  Gender string
+  // 假设后面还有几百个字段...
+}
+
+type APIUser struct {
+  ID   uint
+  Name string
+}
+
+// 查询时会自动选择 `id`, `name` 字段
+db.Model(&User{}).Limit(10).Find(&APIUser{})
+// SELECT `id`, `name` FROM `users` LIMIT 10
+
+```
+
+**注意** `QueryFields` 模式会根据当前 model 的所有字段名称进行 select。
+
+```go
+db, err := gorm.Open(sqlite.Open("gorm.db"), &gorm.Config{
+  QueryFields: true,
+})
+
+db.Find(&user)
+// SELECT `users`.`name`, `users`.`age`, ... FROM `users` // 带上这个选项
+
+// Session Mode
+db.Session(&gorm.Session{QueryFields: true}).Find(&user)
+// SELECT `users`.`name`, `users`.`age`, ... FROM `users`
+```
+
+
+
+### 2、Locking (FOR UPDATE)
+
+- lock in share mode适用于两张表存在业务关系时的一致性要求，for  update适用于操作同一张表时的一致性要求。
+
+```go
+db.Clauses(clause.Locking{Strength: "UPDATE"}).Find(&users)
+// SELECT * FROM `users` FOR UPDATE
+// 此时如果另一个事务也想执行类似的操作：下面的这行sql会等待,直到上面的事务回滚或者commit才得到执行。 
+// *注：当选中某一个行的时候,如果是通过主键id选中的。那么这个时候是行级锁。 
+// 其他的行还是可以直接insert 或者update的。如果是通过其他的方式选中行,或者选中的条件不明确包含主键。这个时候会锁表。其他的事务对该表的任意一行记录都无法进行插入或者更新操作。只能读取。*
+
+db.Clauses(clause.Locking{
+  Strength: "SHARE",
+  Table: clause.Table{Name: clause.CurrentTable},
+}).Find(&users)
+// SELECT * FROM `users` FOR SHARE OF `users`
+// 不知道是否在 mysql 中等价，上面语句mysql报错：SELECT * FROM `users` LOCK IN SHARE MODE 
+// 共享锁，用于关联表修改的时候使用，防止在写入操作时 parent 表的对应记录被删除
+
+db.Clauses(clause.Locking{
+  Strength: "UPDATE",
+  Options: "NOWAIT",
+}).Find(&users)
+// SELECT * FROM `users` FOR UPDATE NOWAIT
+```
+
+
+
+### 3、子查询
+
+子查询可以嵌套在查询中，GORM 允许在使用 `*gorm.DB` 对象作为参数时生成子查询
+
+```go
+db.Where("amount > (?)", db.Table("orders").Select("AVG(amount)")).Find(&orders)
+// SELECT * FROM "orders" WHERE amount > (SELECT AVG(amount) FROM "orders");
+
+subQuery := db.Select("AVG(age)").Where("name LIKE ?", "name%").Table("users")
+db.Select("AVG(age) as avgage").Group("name").Having("AVG(age) > (?)", subQuery).Find(&results)
+// SELECT AVG(age) as avgage FROM `users` GROUP BY `name` HAVING AVG(age) > (SELECT AVG(age) FROM `users` WHERE name LIKE "name%")
+
+```
+
+
+
+### 4、From 子查询
+
+GORM 允许您在 `Table` 方法中通过 FROM 子句使用子查询，例如：
+
+```go
+db.Table("(?) as u", db.Model(&User{}).Select("name", "age")).Where("age = ?", 18}).Find(&User{})
+// SELECT * FROM (SELECT `name`,`age` FROM `users`) as u WHERE `age` = 18
+
+subQuery1 := db.Model(&User{}).Select("name")
+subQuery2 := db.Model(&Pet{}).Select("name")
+db.Table("(?) as u, (?) as p", subQuery1, subQuery2).Find(&User{})
+// SELECT * FROM (SELECT `name` FROM `users`) as u, (SELECT `name` FROM `pets`) as p
+```
+
+- **注意**：子查询和 from 子查询的区别 
+  - 使用 from 子查询需要在 Table() 中传入 *gorm.DB 对象作为参数。
+  - 使用子查询需要在 Where() / Having() 中传入  *gorm.DB 对象作为参数生成子查询。
+
+
+
+### 5、Group 条件
+
+使用 Group 条件可以更轻松的编写复杂 SQL
+
+```go
+db.Where(
+    db.Where("pizza = ?", "pepperoni").Where(db.Where("size = ?", "small").Or("size = ?", "medium")),
+).Or(
+    db.Where("pizza = ?", "hawaiian").Where("size = ?", "xlarge"),
+).Find(&Pizza{}).Statement
+
+// SELECT * FROM `pizzas` WHERE (pizza = "pepperoni" AND (size = "small" OR size = "medium")) OR (pizza = "hawaiian" AND size = "xlarge")
+
+```
+
+- 每个 Where / Having 都是一个 Group，可以在恰当的规则下进行组织。
+
+
+
+### 6、IN with multiple columns
+
+Selecting IN with multiple columns
+
+```go
+db.Where("(name, age, role) IN ?", [][]interface{}{{"jinzhu", 18, "admin"}, {"jinzhu2", 19, "user"}}).Find(&users)
+// SELECT * FROM users WHERE (name, age, role) IN (("jinzhu", 18, "admin"), ("jinzhu 2", 19, "user"));
+```
+
+
+
+### 7、Named Argument
+
+GORM supports named arguments with [`sql.NamedArg`](https://tip.golang.org/pkg/database/sql/#NamedArg) or `map[string]interface{}{}`, for example:
+
+```go
+db.Where("name1 = @name OR name2 = @name", sql.Named("name", "jinzhu")).Find(&user)
+// SELECT * FROM `users` WHERE name1 = "jinzhu" OR name2 = "jinzhu"
+
+db.Where("name1 = @name OR name2 = @name", map[string]interface{}{"name": "jinzhu"}).First(&user)
+// SELECT * FROM `users` WHERE name1 = "jinzhu" OR name2 = "jinzhu" ORDER BY `users`.`id` LIMIT 1
+```
+
+Check out [Raw SQL and SQL Builder](https://gorm.io/zh_CN/docs/sql_builder.html#named_argument) for more detail
+
+
+
+### 8、Find To Map
+
+GORM allows scan result to `map[string]interface{}` or `[]map[string]interface{}`, don’t forget to specify `Model` or `Table`, for example:
+
+- specify： 明确指定
+
+```go
+result := map[string]interface{}{}
+db.Model(&User{}).First(&result, "id = ?", 1)
+
+var results []map[string]interface{}
+db.Table("users").Find(&results)
+```
+
+
+
+### 9、FirstOrInit
+
+Get first matched record or initialize a new instance with given conditions (only works with struct or map conditions)
+
+- 查询第一条 matched 到的 record，如果没有 matched 到就按照条件返回一条初始化的 record 
+
+```go
+// User not found, initialize it with give conditions
+db.FirstOrInit(&user, User{Name: "non_existing"})
+// user -> User{Name: "non_existing"}
+
+// Found user with `name` = `jinzhu`
+db.Where(User{Name: "jinzhu"}).FirstOrInit(&user)
+// user -> User{ID: 111, Name: "Jinzhu", Age: 18}
+
+// Found user with `name` = `jinzhu`
+db.FirstOrInit(&user, map[string]interface{}{"name": "jinzhu"})
+// user -> User{ID: 111, Name: "Jinzhu", Age: 18}
+```
+
+initialize struct with more attributes if record not found, those `Attrs` won’t be used to build SQL query
+
+- 如果未找到记录，则使用参数初始化结构
+- Attrs 不会去构建 SQL 语句，只会作为未查到记录时的初始化结构参数。
+
+```go
+// User not found, initialize it with give conditions and Attrs
+db.Where(User{Name: "non_existing"}).Attrs(User{Age: 20}).FirstOrInit(&user)
+// SELECT * FROM USERS WHERE name = 'non_existing' ORDER BY id LIMIT 1;
+// user -> User{Name: "non_existing", Age: 20}
+
+// User not found, initialize it with give conditions and Attrs
+db.Where(User{Name: "non_existing"}).Attrs("age", 20).FirstOrInit(&user)
+// SELECT * FROM USERS WHERE name = 'non_existing' ORDER BY id LIMIT 1;
+// user -> User{Name: "non_existing", Age: 20}
+
+// Found user with `name` = `jinzhu`, attributes will be ignored
+db.Where(User{Name: "Jinzhu"}).Attrs(User{Age: 20}).FirstOrInit(&user)
+// SELECT * FROM USERS WHERE name = jinzhu' ORDER BY id LIMIT 1;
+// user -> User{ID: 111, Name: "Jinzhu", Age: 18}
+```
+
+`Assign` attributes to struct regardless it is found or not, those attributes won’t be used to build SQL query and the final data won’t be saved into database
+
+- 将参数分配给结果，不管它是否被找到
+- Assign 指定;指派;分派
+
+```go
+// User not found, initialize it with give conditions and Assign attributes
+db.Where(User{Name: "non_existing"}).Assign(User{Age: 20}).FirstOrInit(&user)
+// user -> User{Name: "non_existing", Age: 20}
+
+// Found user with `name` = `jinzhu`, update it with Assign attributes
+db.Where(User{Name: "Jinzhu"}).Assign(User{Age: 20}).FirstOrInit(&user)
+// SELECT * FROM USERS WHERE name = jinzhu' ORDER BY id LIMIT 1;
+// user -> User{ID: 111, Name: "Jinzhu", Age: 20}
+```
+
+
+
+### 10、FirstOrCreate
+
+Get first matched record or create a new one with given conditions (only works with struct, map conditions)
+
+- 如果查询不到就添加
+
+```go
+// User not found, create a new record with give conditions
+db.FirstOrCreate(&user, User{Name: "non_existing"})
+// INSERT INTO "users" (name) VALUES ("non_existing");
+// user -> User{ID: 112, Name: "non_existing"}
+
+// Found user with `name` = `jinzhu`
+db.Where(User{Name: "jinzhu"}).FirstOrCreate(&user)
+// user -> User{ID: 111, Name: "jinzhu", "Age": 18}
+```
+
+Create struct with more attributes if record not found, those `Attrs` won’t be used to build SQL query
+
+- 如果未找到记录，则使用参数创建记录
+- Attrs 不会去构建 SQL 语句，只会作为未查到记录时的初始化结构参数。
+
+```go
+// User not found, create it with give conditions and Attrs
+db.Where(User{Name: "non_existing"}).Attrs(User{Age: 20}).FirstOrCreate(&user)
+// SELECT * FROM users WHERE name = 'non_existing' ORDER BY id LIMIT 1;
+// INSERT INTO "users" (name, age) VALUES ("non_existing", 20);
+// user -> User{ID: 112, Name: "non_existing", Age: 20}
+
+// Found user with `name` = `jinzhu`, attributes will be ignored
+db.Where(User{Name: "jinzhu"}).Attrs(User{Age: 20}).FirstOrCreate(&user)
+// SELECT * FROM users WHERE name = 'jinzhu' ORDER BY id LIMIT 1;
+// user -> User{ID: 111, Name: "jinzhu", Age: 18}
+```
+
+`Assign` attributes to the record regardless it is found or not and save them back to the database.
+
+- 无论是否对错，都会去修改数据库
+- 会操作 updated_at
+
+```go
+// User not found, initialize it with give conditions and Assign attributes
+db.Where(User{Name: "non_existing"}).Assign(User{Age: 20}).FirstOrCreate(&user)
+// SELECT * FROM users WHERE name = 'non_existing' ORDER BY id LIMIT 1;
+// INSERT INTO "users" (name, age) VALUES ("non_existing", 20);
+// user -> User{ID: 112, Name: "non_existing", Age: 20}
+
+// Found user with `name` = `jinzhu`, update it with Assign attributes
+db.Where(User{Name: "jinzhu"}).Assign(User{Age: 20}).FirstOrCreate(&user)
+// SELECT * FROM users WHERE name = 'jinzhu' ORDER BY id LIMIT 1;
+// UPDATE users SET age=20 WHERE id = 111;
+// user -> User{ID: 111, Name: "jinzhu", Age: 20}
+```
+
+
+
+### 11、Optimizer/Index Hints
+
+Optimizer hints allow to control the query optimizer to choose a certain query execution plan, GORM supports it with `gorm.io/hints`, e.g:
+
+- Optimizer Hints 优化器提示
+- Index Hints 索引提示
+- certain 某种
+- 优化器提示：允许控制查询优化器选择某个查询执行计划
+
+```go
+import "gorm.io/hints"
+
+db.Clauses(hints.New("MAX_EXECUTION_TIME(10000)")).Find(&User{})
+// SELECT * /*+ MAX_EXECUTION_TIME(10000) */ FROM `users`
+```
+
+Index hints allow passing index hints to the database in case the query planner gets confused.
+
+- 索引提示允许将索引提示传递到数据库，以防查询计划器混淆。
+
+```go
+import "gorm.io/hints"
+
+db.Clauses(hints.UseIndex("idx_user_name")).Find(&User{})
+// SELECT * FROM `users` USE INDEX (`idx_user_name`)
+
+db.Clauses(hints.ForceIndex("idx_user_name", "idx_user_id").ForJoin()).Find(&User{})
+// SELECT * FROM `users` FORCE INDEX FOR JOIN (`idx_user_name`,`idx_user_id`)"
+```
+
+Refer [Optimizer Hints/Index/Comment](https://gorm.io/zh_CN/docs/hints.html) for more details
+
+
+
+### 12、Iteration
+
+GORM supports iterating through Rows
+
+- GORM支持对行进行迭代
+- Iteration 迭代
+
+```go
+rows, err := db.Model(&User{}).Where("name = ?", "jinzhu").Rows()
+defer rows.Close()
+
+for rows.Next() {
+  var user User
+  // ScanRows is a method of `gorm.DB`, it can be used to scan a row into a struct
+  db.ScanRows(rows, &user)
+
+  // do something
+}
+```
+
+
+
+### 13、FindInBatches
+
+Query and process records in batch
+
+- 批量查询和处理记录
+- `FindInBatches(&results, batch, func(tx *gorm.DB, batch int) error)`
+
+```go
+// batch size 100  // 每次处理的 100 条记录
+result := db.Where("processed = ?", false).FindInBatches(&results, 100, func(tx *gorm.DB, batch int) error {
+	/*
+		官方网址给的例子是 for _, result := range results
+		但是我个人觉得 for index, _ := range results 会更好
+		因为对 records 作处理需要使用下标。
+	*/
+  for _, result := range results {
+    // batch processing found records
+  }
+
+  tx.Save(&results)
+
+  tx.RowsAffected // number of records in this batch
+
+  batch // Batch 1, 2, 3
+
+  // returns error will stop future batches
+  return nil
+})
+
+result.Error // returned error
+result.RowsAffected // processed records count in all batches
+```
+
+
+
+### 14、Query Hooks
+
+GORM allows hooks `AfterFind` for a query, it will be called when querying a record, refer [Hooks](https://gorm.io/zh_CN/docs/hooks.html) for details
+
+- 查询钩子，查询到的每一行数据都会调这个方法
+
+```go
+func (u *User) AfterFind(tx *gorm.DB) (err error) {
+  if u.Role == "" {
+    u.Role = "user"
+  }
+  return
+}
+```
+
+
+
+### 15、Pluck
+
+Query single column from database and scan into a slice, if you want to query multiple columns, use `Select` with [`Scan`](https://gorm.io/zh_CN/docs/query.html#scan) instead
+
+- 只查询一个字段
+- 如果需要查询多个字段使用 Select 加上 Scan
+
+```go
+var ages []int64
+db.Model(&users).Pluck("age", &ages)
+
+var names []string
+db.Model(&User{}).Pluck("name", &names)
+
+db.Table("deleted_users").Pluck("name", &names)
+
+// Distinct Pluck
+db.Model(&User{}).Distinct().Pluck("Name", &names)
+// SELECT DISTINCT `name` FROM `users`
+
+// Requesting more than one column, use `Scan` or `Find` like this:
+db.Select("name", "age").Scan(&users)
+db.Select("name", "age").Find(&users)
+```
+
+
+
+### 16、Scopes
+
+`Scopes` allows you to specify commonly-used queries which can be referenced as method calls
+
+- `Scopes`允许您指定常用的查询，这些查询可以作为方法调用引用
+- Scopes 范围
+- commonly-used 常用的
+- specify  具体说明
+
+```go
+func AmountGreaterThan1000(db *gorm.DB) *gorm.DB {
+  return db.Where("amount > ?", 1000)
+}
+
+func PaidWithCreditCard(db *gorm.DB) *gorm.DB {
+  return db.Where("pay_mode_sign = ?", "C")
+}
+
+func PaidWithCod(db *gorm.DB) *gorm.DB {
+  return db.Where("pay_mode_sign = ?", "C")
+}
+
+func OrderStatus(status []string) func (db *gorm.DB) *gorm.DB {
+  return func (db *gorm.DB) *gorm.DB {
+    return db.Where("status IN (?)", status)
+  }
+}
+
+db.Scopes(AmountGreaterThan1000, PaidWithCreditCard).Find(&orders)
+// Find all credit card orders and amount greater than 1000
+
+db.Scopes(AmountGreaterThan1000, PaidWithCod).Find(&orders)
+// Find all COD orders and amount greater than 1000
+
+db.Scopes(AmountGreaterThan1000, OrderStatus([]string{"paid", "shipped"})).Find(&orders)
+// Find all paid, shipped orders that amount greater than 1000
+```
+
+
+
+### 17、Count
+
+Get matched records count
+
+- 匹配查询结果数量
+
+```go
+var count int64
+db.Model(&User{}).Where("name = ?", "jinzhu").Or("name = ?", "jinzhu 2").Count(&count)
+// SELECT count(1) FROM users WHERE name = 'jinzhu' OR name = 'jinzhu 2'
+
+db.Model(&User{}).Where("name = ?", "jinzhu").Count(&count)
+// SELECT count(1) FROM users WHERE name = 'jinzhu'; (count)
+
+db.Table("deleted_users").Count(&count)
+// SELECT count(1) FROM deleted_users;
+
+// Count with Distinct
+db.Model(&User{}).Distinct("name").Count(&count)
+// SELECT COUNT(DISTINCT(`name`)) FROM `users`
+
+db.Table("deleted_users").Select("count(distinct(name))").Count(&count)
+// SELECT count(distinct(name)) FROM deleted_users
+
+// Count with Group
+users := []User{
+  {Name: "name1"},
+  {Name: "name2"},
+  {Name: "name3"},
+  {Name: "name3"},
+}
+
+db.Model(&User{}).Group("name").Count(&count)
+count // => 3
+```
+
+
+
 # 自定义数据类型
 
 GORM 提供了少量接口，使用户能够为 GORM 定义支持的数据类型，这里以 [json](https://github.com/go-gorm/datatypes/blob/master/json.go) 为例
