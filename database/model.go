@@ -1,15 +1,15 @@
 package database
 
 import (
-	"gorm.io/gorm"
 	"time"
 )
 
 type User struct {
-	gorm.Model
+	// gorm.Model
 	ID       int `gorm:"primaryKey"`
 	Name     string
 	Age      int
+	Active   bool
 	Birthday *time.Time
 }
 
